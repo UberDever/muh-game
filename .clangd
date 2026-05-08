@@ -1,0 +1,22 @@
+CompileFlags:
+  Add:
+    - -x
+    - c
+    - -g
+    - -fsanitize=address,undefined
+    - -D_POSIX_C_SOURCE=200809L
+    - -I.
+  Compiler: cc
+Diagnostics:
+  ClangTidy:
+    Add: 
+      - readability-*
+      - clang-analyzer-*
+    Remove: 
+      - modernize-*
+      - cppcoreguidelines-*
+      - readability-identifier-length
+      - readability-function-cognitive-complexity
+      - readability-magic-numbers
+Index:
+  Background: Build
