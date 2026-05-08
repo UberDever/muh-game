@@ -126,7 +126,23 @@ function muh_ninja.new(b)
 end
 
 function muh_ninja.already_built(target)
-    return false
+    local out_attr = lfs.attributes(target.name)
+    if not out_attr then return false end
+    local out_mtime = out_attr.modification
+
+    for _, src in ipairs(target.ins) do
+        local in_attr = lfs.attributes(src)
+        if not in_attr then return false end
+        if in_attr.modification > out_mtime then return false end
+    end
+
+    for _, dep in ipairs(target.deps) do
+        local dep_attr = lfs.attributes(dep.name)
+        if not dep_attr then return false end
+        if dep_attr.modification > out_mtime then return false end
+    end
+
+    return true
 end
 
 function muh_ninja.run(target)
