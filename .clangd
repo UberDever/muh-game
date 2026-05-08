@@ -5,7 +5,6 @@ CompileFlags:
     - -g
     - -fsanitize=address,undefined
     - -D_POSIX_C_SOURCE=200809L
-    - -I.
   Compiler: cc
 Diagnostics:
   ClangTidy:

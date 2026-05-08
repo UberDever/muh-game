@@ -8,6 +8,20 @@ local function path_join(...)
     return (table.concat(args, OS_SEP):gsub(OS_SEP .. OS_SEP .. "+", OS_SEP))
 end
 
+local function path_normalize(p)
+    local parts = {}
+    for seg in p:gmatch("[^/]+") do
+        if seg == ".." and #parts > 0 and parts[#parts] ~= ".." then
+            parts[#parts] = nil
+        elseif seg ~= "." then
+            parts[#parts + 1] = seg
+        end
+    end
+    local result = table.concat(parts, "/")
+    if p:sub(1, 1) == "/" then result = "/" .. result end
+    return result
+end
+
 local function sorted_keys(t)
     local keys = {}
     for k in pairs(t) do
@@ -20,15 +34,18 @@ end
 local function get_script_path()
     local is_unix = OS_SEP == "/"
     assert(is_unix, "OS not supported")
-    local h = io.popen("pwd")
-    assert(h)
-    local cwd = h:read("*l")
-    h:close()
-    local full_path = path_join(cwd, arg[0])
-    return full_path:match("(.*[/\\])") or ""
+    local script = arg[0]
+    if not script:match("^/") then
+        local h = io.popen("pwd")
+        assert(h)
+        local cwd = h:read("*l")
+        h:close()
+        script = path_join(cwd, script)
+    end
+    return script:match("(.*[/\\])") or ""
 end
 
-local PROJECT_PATH = path_join(get_script_path(), "..")
+local PROJECT_PATH = path_normalize(path_join(get_script_path(), ".."))
 local LUA_SRC_PATH = path_join(PROJECT_PATH, "vendor", "lua-5.5.0")
 
 local lfs_dir = path_join(PROJECT_PATH, "vendor", "lfs")
@@ -50,6 +67,10 @@ end
 
 package.cpath = path_join(lfs_dir, "?.so") .. ";" .. package.cpath
 local lfs = require "lfs"
+
+local function json_escape(s)
+    return s:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t')
+end
 
 ---@class build
 local build = {}
@@ -94,15 +115,20 @@ function build.print_usage()
 Usage: lua scripts/build.lua [flags]
 
 Flags:
-  -m, --manifest <path>   Path to manifest file (required unless --help)
-  -t, --target <name>     Build single target (e.g. cmd:game, test:game, lib:game)
-  -l, --list              List available targets and exit
-  -h, --help              Show this help and exit
+  -m,  --manifest <path>          Path to manifest file (required unless --help)
+  -t,  --target <name>            Build/clean single target (e.g. cmd:game, lib:game)
+  -l,  --list                     List available targets and exit
+  -cc, --compile_commands         Regenerate compile_commands.json and exit
+  -c,  --clean                    Remove build artifacts (all or specific -t target)
+  -h,  --help                     Show this help and exit
 
 Examples:
   lua scripts/build.lua -m scripts/manifest.linux.lua
   lua scripts/build.lua -m scripts/manifest.linux.lua -t cmd:game
   lua scripts/build.lua -m scripts/manifest.linux.lua --list
+  lua scripts/build.lua -m scripts/manifest.linux.lua --compile_commands
+  lua scripts/build.lua -m scripts/manifest.linux.lua --clean
+  lua scripts/build.lua -m scripts/manifest.linux.lua --clean -t lib:game
   lua scripts/build.lua --help]])
 end
 
@@ -135,6 +161,12 @@ function build:parse_args()
             cur_flag = cur_flag + 1
         elseif flag == "--list" or flag == "-l" then
             self.mode = "list"
+            cur_flag = cur_flag + 1
+        elseif flag == "--compile_commands" or flag == "-cc" then
+            self.mode = "compiledb"
+            cur_flag = cur_flag + 1
+        elseif flag == "--clean" or flag == "-c" then
+            self.mode = "clean"
             cur_flag = cur_flag + 1
         elseif flag == "--help" or flag == "-h" then
             self.mode = "help"
@@ -178,7 +210,7 @@ function target:run()
     end
 end
 
-function target:compile()
+function target:compile_args()
     local mn = self.manifest
     local cmd = {}
 
@@ -198,6 +230,11 @@ function target:compile()
     cmd[#cmd + 1] = "-o"
     cmd[#cmd + 1] = self.name
 
+    return cmd
+end
+
+function target:compile()
+    local cmd = self:compile_args()
     build.ensure_parent_dir(self.name)
     local cmd_str = table.concat(cmd, " ")
     print("compile: " .. cmd_str)
@@ -280,16 +317,41 @@ function muh_ninja.already_built(target)
     return true
 end
 
-function muh_ninja.run(target)
-    if muh_ninja.already_built(target) then
-        return true
+function muh_ninja.topo_sort(root)
+    local order = {}
+    local visited = {}
+    local function visit(node)
+        if visited[node] then return end
+        visited[node] = true
+        for i = 1, #node.deps do
+            visit(node.deps[i])
+        end
+        order[#order + 1] = node
     end
-    for i = 1, #target.deps do
-        if not muh_ninja.run(target.deps[i]) then
-            return false
+    visit(root)
+    return order
+end
+
+function muh_ninja.run(root)
+    local order = muh_ninja.topo_sort(root)
+    for i = 1, #order do
+        local node = order[i]
+        if not muh_ninja.already_built(node) then
+            if not node:run() then return false end
         end
     end
-    return target:run()
+    return true
+end
+
+function muh_ninja.clean(root)
+    local order = muh_ninja.topo_sort(root)
+    -- reverse topo: dependents before deps
+    for i = #order, 1, -1 do
+        local node = order[i]
+        if os.remove(node.name) then
+            print("rm: " .. node.name)
+        end
+    end
 end
 
 function muh_ninja:target_compile(path, name, build_args, deps)
@@ -407,6 +469,7 @@ function muh_cmake:generate()
     local all_lib_targets = {}
     local named = {}
     local default_targets = {}
+    local compile_targets = {}
 
     local pkg_names = sorted_keys(self.packages)
 
@@ -421,6 +484,7 @@ function muh_cmake:generate()
             local t = self.ninja:target_compile(src, obj_path, common_cflags, {})
             obj_targets[#obj_targets + 1] = t
             obj_paths[#obj_paths + 1] = obj_path
+            compile_targets[#compile_targets + 1] = t
         end
 
         if #obj_paths > 0 then
@@ -437,6 +501,7 @@ function muh_cmake:generate()
         local cmd_info = self.cmds[name]
         local obj_path = path_join(build_dir, "objs", "cmd", name, "main.o")
         local main_t = self.ninja:target_compile(cmd_info.src, obj_path, common_cflags, {})
+        compile_targets[#compile_targets + 1] = main_t
 
         local link_ins = { obj_path }
         local link_deps = { main_t }
@@ -458,6 +523,7 @@ function muh_cmake:generate()
             local basename = test_src:match("([^/\\]+)%.c$")
             local obj_path = path_join(build_dir, "objs", "internal", name, basename .. ".o")
             local test_obj_t = self.ninja:target_compile(test_src, obj_path, common_cflags, {})
+            compile_targets[#compile_targets + 1] = test_obj_t
 
             local link_ins = { obj_path }
             local link_deps = { test_obj_t }
@@ -478,7 +544,41 @@ function muh_cmake:generate()
     return {
         named = named,
         defaults = default_targets,
+        compile_targets = compile_targets,
+        build_dir = build_dir,
     }
+end
+
+function muh_cmake.write_compile_commands(targets_result)
+    local compile_targets = targets_result.compile_targets
+    local build_dir = targets_result.build_dir
+
+    local entries = {}
+    for _, t in ipairs(compile_targets) do
+        local args = t:compile_args()
+
+        local args_json = {}
+        for _, a in ipairs(args) do
+            args_json[#args_json + 1] = '"' .. json_escape(a) .. '"'
+        end
+
+        entries[#entries + 1] = string.format(
+            '  {\n    "directory": "%s",\n    "file": "%s",\n    "arguments": [%s],\n    "output": "%s"\n  }',
+            json_escape(PROJECT_PATH),
+            json_escape(t.ins[1]),
+            table.concat(args_json, ", "),
+            json_escape(t.name)
+        )
+    end
+
+    local json = "[\n" .. table.concat(entries, ",\n") .. "\n]\n"
+    local out_path = path_join(build_dir, "compile_commands.json")
+    build.mkdir_p(build_dir)
+    local f = io.open(out_path, "w")
+    assert(f, "Cannot open " .. out_path)
+    f:write(json)
+    f:close()
+    print("wrote: " .. out_path)
 end
 
 local b = build.new()
@@ -487,11 +587,29 @@ b:parse_args()
 local ninja = muh_ninja.new(b)
 local cmake = muh_cmake.new(b, ninja)
 local targets = cmake:generate()
+muh_cmake.write_compile_commands(targets)
 
 if b.mode == "list" then
     local names = sorted_keys(targets.named)
     for _, name in ipairs(names) do
         print(name)
+    end
+    os.exit(0)
+end
+
+if b.mode == "compiledb" then
+    os.exit(0)
+end
+
+if b.mode == "clean" then
+    if b.target then
+        local entry = targets.named[b.target]
+        assert(entry, "Unknown target '" .. b.target .. "'. Use --list to see available targets.")
+        muh_ninja.clean(entry.target)
+    else
+        for _, dt in ipairs(targets.defaults) do
+            muh_ninja.clean(dt.target)
+        end
     end
     os.exit(0)
 end

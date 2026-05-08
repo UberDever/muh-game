@@ -7,3 +7,4 @@ eval/config.h
 zig-out
 .zig-cache
 tmp/
+.cache
