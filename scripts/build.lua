@@ -1,314 +1,263 @@
-local os = require "os"
-local io = require "io"
+local os           = require "os"
+local io           = require "io"
 
-local OS_SEP = package.config:sub(1, 1)
+-- Add the script's own directory to package.path so require("build_impl") works
+-- regardless of the working directory.
+local _script_dir  = (arg[0]:match("(.*[/\\])") or "./")
+package.path       = _script_dir .. "?.lua;" .. package.path
 
-local function path_join(...)
-    local args = { ... }
-    return (table.concat(args, OS_SEP):gsub(OS_SEP .. OS_SEP .. "+", OS_SEP))
-end
+local impl         = require "build_impl"
 
-local function path_normalize(p)
+local path_join    = impl.path_join
+local sorted_keys  = impl.sorted_keys
+local PROJECT_PATH = impl.PROJECT_PATH
+local lfs          = impl.lfs
+local json_escape  = impl.json_escape
+local resolve_path = impl.resolve_path
+
+---@class VendorLibCmake
+---@field kind "cmake"
+---@field name string
+---@field version string
+---@field cmake_minimum_version string
+---@field src string
+---@field out string
+---@field cmake_args string[]
+---@field cmake_build_target string?
+---@field sentinel string
+---@field include_dirs string[]
+---@field static_libs string[]
+
+---@class InstallRule
+---@field src string   Path relative to build_dir
+---@field dest string  Path relative to install prefix
+
+-- NOTE: see manifests in the adjacent folder for examples
+---@class Manifest
+---@field build_dir string
+---@field system_libs string[]?
+---@field install_prefix string?
+---@field install_rules InstallRule[]?
+---@field compile_cmd fun(out: string, src: string, extra_args: string[]): string
+---@field link_cmd fun(out: string, ins: string[], extra_args: string[]): string
+---@field archive_cmd fun(out: string, ins: string[]): string
+---@field cmake_lib_cmd fun(vl: VendorLibCmake, src: string, out_dir: string): string
+---@field vendor_libs VendorLibCmake[]?
+
+---@alias Subcommand "build"|"list"|"clean"|"compiledb"|"install"|"help"
+
+---@class Infra
+---@field manifest Manifest?
+---@field target string?
+---@field subcommand Subcommand
+---@field prefix string?
+local Infra        = {}
+Infra.__index      = Infra
+Infra.path_join    = path_join
+Infra.PROJECT_PATH = PROJECT_PATH
+
+local SUBCOMMANDS = {
+    build = true, list = true, clean = true,
+    compiledb = true, install = true, help = true,
+}
+
+
+--- Parse a dotted version string into a list of integers.
+--- e.g. "3.16.2" → {3, 16, 2}
+---@param s string
+---@return integer[]
+function Infra.parse_version(s)
     local parts = {}
-    for seg in p:gmatch("[^/]+") do
-        if seg == ".." and #parts > 0 and parts[#parts] ~= ".." then
-            parts[#parts] = nil
-        elseif seg ~= "." then
-            parts[#parts + 1] = seg
-        end
+    for n in s:gmatch("(%d+)") do
+        parts[#parts + 1] = tonumber(n)
     end
-    local result = table.concat(parts, "/")
-    if p:sub(1, 1) == "/" then result = "/" .. result end
-    return result
+    return parts
 end
 
-local function sorted_keys(t)
-    local keys = {}
-    for k in pairs(t) do
-        keys[#keys + 1] = k
+--- Compare two parsed version tables (as returned by parse_version).
+--- Returns -1 if a < b, 0 if equal, 1 if a > b.
+---@param a integer[]
+---@param b integer[]
+---@return -1|0|1
+function Infra.compare_versions(a, b)
+    local len = math.max(#a, #b)
+    for i = 1, len do
+        local va = a[i] or 0
+        local vb = b[i] or 0
+        if va < vb then return -1 end
+        if va > vb then return 1 end
     end
-    table.sort(keys)
-    return keys
+    return 0
 end
 
-local function get_script_path()
-    local is_unix = OS_SEP == "/"
-    assert(is_unix, "OS not supported")
-    local script = arg[0]
-    if not script:match("^/") then
-        local h = io.popen("pwd")
-        assert(h)
-        local cwd = h:read("*l")
-        h:close()
-        script = path_join(cwd, script)
-    end
-    return script:match("(.*[/\\])") or ""
+--- Run `<tool> --version` and extract the first version-like string from
+--- the first line of output.  Returns the version string or nil.
+---@param tool_cmd string
+---@return string?
+function Infra.get_tool_version(tool_cmd)
+    local h = io.popen(tool_cmd .. " --version 2>/dev/null")
+    if not h then return nil end
+    local line = h:read("*l")
+    h:close()
+    if not line then return nil end
+    return line:match("(%d+%.%d+[%.%d]*)")
 end
 
-local PROJECT_PATH = path_normalize(path_join(get_script_path(), ".."))
-local LUA_SRC_PATH = path_join(PROJECT_PATH, "vendor", "lua-5.5.0")
-
-local lfs_dir = path_join(PROJECT_PATH, "vendor", "lfs")
-local lfs_so = path_join(lfs_dir, "lfs.so")
-local lfs_src = path_join(lfs_dir, "lfs.c")
-
-local f = io.open(lfs_so, "r")
-if not f then
-    local cmd = string.format(
-        "cc -shared -fPIC -O2 -o %s %s -I%s -I%s",
-        lfs_so, lfs_src, lfs_dir, LUA_SRC_PATH
-    )
-    print("bootstrap: " .. cmd)
-    local ok, _, code = os.execute(cmd)
-    assert(ok, "Failed to compile lfs (exit " .. tostring(code) .. ")")
-else
-    f:close()
+--- Convenience wrapper: get the installed cmake version string.
+---@return string?
+function Infra.get_cmake_version()
+    return Infra.get_tool_version("cmake")
 end
 
-package.cpath = path_join(lfs_dir, "?.so") .. ";" .. package.cpath
-local lfs = require "lfs"
-
-local function json_escape(s)
-    return s:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t')
-end
-
----@class build
-local build = {}
-build.__index = build
-
-build.path_join = path_join
-
-function build.parent_dir(path)
-    return path:match("(.*)[/\\][^/\\]+$")
-end
-
-function build.mkdir_p(path)
-    if not path or path == "" then return end
-    local attr = lfs.attributes(path)
-    if attr and attr.mode == "directory" then return end
-    build.mkdir_p(build.parent_dir(path))
-    lfs.mkdir(path)
-end
-
-function build.ensure_parent_dir(filepath)
-    local dir = build.parent_dir(filepath)
-    if dir then build.mkdir_p(dir) end
-end
-
---- NOTE: splits on whitespace; paths with spaces will break.
-function build.cmd_append_arg(cmd, value)
-    if type(value) == "string" then
-        for part in value:gmatch("%S+") do
-            cmd[#cmd + 1] = part
-        end
-    end
-end
-
-function build.is_absolute(path)
-    return path:sub(1, 1) == "/"
-        or path:match("^%a:[/\\]") ~= nil
-        or path:match("^[/\\][/\\]") ~= nil
-end
-
-function build.print_usage()
+function Infra.print_usage()
     print([[
-Usage: lua scripts/build.lua [flags]
+Usage: lua scripts/build.lua <command> [options]
 
-Flags:
-  -m,  --manifest <path>          Path to manifest file (required unless --help)
-  -t,  --target <name>            Build/clean single target (e.g. cmd:game, lib:game)
-  -l,  --list                     List available targets and exit
-  -cc, --compile_commands         Regenerate compile_commands.json and exit
-  -c,  --clean                    Remove build artifacts (all or specific -t target)
-  -h,  --help                     Show this help and exit
+Commands:
+  build      Build targets (default if no command given)
+  list       List available targets and exit
+  clean      Remove build artifacts (all or specific -t target)
+  compiledb  Regenerate compile_commands.json and exit
+  install    Build default targets and install per manifest rules
+  help       Show this help and exit
 
-Examples:
-  lua scripts/build.lua -m scripts/manifest.linux.lua
-  lua scripts/build.lua -m scripts/manifest.linux.lua -t cmd:game
-  lua scripts/build.lua -m scripts/manifest.linux.lua --list
-  lua scripts/build.lua -m scripts/manifest.linux.lua --compile_commands
-  lua scripts/build.lua -m scripts/manifest.linux.lua --clean
-  lua scripts/build.lua -m scripts/manifest.linux.lua --clean -t lib:game
-  lua scripts/build.lua --help]])
+Options:
+  -m, --manifest <path>   Path to manifest file (required for all commands except help)
+  -t, --target <name>     Build/clean a single target (e.g. cmd:game, lib:game, vendor:SDL3)
+  -p, --prefix <path>     Override path prefix (build_dir for build/clean, install_prefix for install)]])
 end
 
-function build.new()
-    local self = setmetatable({}, build)
+---@return Infra
+function Infra.new()
+    local self = setmetatable({}, Infra)
     self.manifest = nil
     self.target = nil
-    self.mode = "build"
+    self.subcommand = "build"
+    self.prefix = nil
     return self
 end
 
-function build:parse_args()
-    local cur_flag = 1
-    while arg[cur_flag] do
-        local flag = arg[cur_flag]
+---@param cur_arg integer
+---@param flag string
+---@return string value, integer next_arg
+local function consume_flag_value(cur_arg, flag)
+    cur_arg = cur_arg + 1
+    assert(cur_arg <= #arg, "Expected value for flag '" .. flag .. "'")
+    return arg[cur_arg], cur_arg + 1
+end
+
+function Infra:parse_args()
+    local cur_arg = 1
+
+    -- First positional argument is the subcommand (if it doesn't start with '-')
+    if arg[cur_arg] and not arg[cur_arg]:match("^%-") then
+        local subcmd = arg[cur_arg]
+        if not SUBCOMMANDS[subcmd] then
+            local names = sorted_keys(SUBCOMMANDS)
+            error("Unknown command '" .. subcmd
+                .. "'. Available: " .. table.concat(names, ", "))
+        end
+        self.subcommand = subcmd
+        cur_arg = cur_arg + 1
+    end
+
+    -- Parse remaining flags
+    while arg[cur_arg] do
+        local flag = arg[cur_arg]
 
         if flag == "--manifest" or flag == "-m" then
-            cur_flag = cur_flag + 1
-            assert(cur_flag <= #arg, "Expected value for flag '" .. flag .. "'")
-            local flag_value = arg[cur_flag]
-            cur_flag = cur_flag + 1
-            if not build.is_absolute(flag_value) then
-                flag_value = lfs.currentdir() .. OS_SEP .. flag_value
+            local val; val, cur_arg = consume_flag_value(cur_arg, flag)
+            if not impl.is_absolute(val) then
+                val = lfs.currentdir() .. impl.OS_SEP .. val
             end
-            self.manifest = dofile(flag_value)
+            self.manifest = dofile(val)
         elseif flag == "--target" or flag == "-t" then
-            cur_flag = cur_flag + 1
-            assert(cur_flag <= #arg, "Expected value for flag '" .. flag .. "'")
-            self.target = arg[cur_flag]
-            cur_flag = cur_flag + 1
-        elseif flag == "--list" or flag == "-l" then
-            self.mode = "list"
-            cur_flag = cur_flag + 1
-        elseif flag == "--compile_commands" or flag == "-cc" then
-            self.mode = "compiledb"
-            cur_flag = cur_flag + 1
-        elseif flag == "--clean" or flag == "-c" then
-            self.mode = "clean"
-            cur_flag = cur_flag + 1
-        elseif flag == "--help" or flag == "-h" then
-            self.mode = "help"
-            cur_flag = cur_flag + 1
+            self.target, cur_arg = consume_flag_value(cur_arg, flag)
+        elseif flag == "--prefix" or flag == "-p" then
+            self.prefix, cur_arg = consume_flag_value(cur_arg, flag)
         else
             error("Unknown flag '" .. flag .. "'")
         end
     end
 
-    if self.mode == "help" then
-        build.print_usage()
+    if self.subcommand == "help" then
+        Infra.print_usage()
         os.exit(0)
     end
 
-    assert(self.manifest, "Manifest nil!!")
+    assert(self.manifest, "Manifest is required. Use -m <path> to specify a manifest file.")
+
+    -- In non-install modes, --prefix overrides manifest build_dir
+    if self.prefix and self.subcommand ~= "install" then
+        self.manifest.build_dir = self.prefix
+    end
 end
 
-local target = {}
-target.__index = target
+-- ── Target ─────────────────────────────────────────────────────────────────
 
-function target.new(kind, fields)
-    local self = setmetatable({}, target)
-    self.kind = kind
-    self.name = fields.name
-    self.manifest = fields.manifest
-    self.build_args = fields.build_args or {}
+---@class Target
+---@field name string           Output path (file or sentinel)
+---@field ins string[]          Input paths (source files, object files, etc.)
+---@field deps Target[]         Targets that must be built first
+---@field command fun(name: string, ins: string[]): string   Returns shell command string
+---@field clean_fn (fun(name: string))?  Non-standard cleanup (e.g. rmdir)
+---@field tag string            Label for printing ("compile", "archive", etc.)
+local Target = {}
+Target.__index = Target
+
+function Target.new(fields)
+    local self = setmetatable({}, Target)
+    self.name = assert(fields.name, "target missing 'name'")
     self.ins = fields.ins or {}
     self.deps = fields.deps or {}
+    self.command = assert(fields.command, "target missing 'command'")
+    self.clean_fn = fields.clean
+    self.tag = fields.tag or "build"
     return self
 end
 
-function target:run()
-    if self.kind == "compile" then
-        return self:compile()
-    elseif self.kind == "link_exe" then
-        return self:link_exe()
-    elseif self.kind == "archive" then
-        return self:archive()
-    else
-        error("unknown target kind: " .. tostring(self.kind))
-    end
-end
-
-function target:compile_args()
-    local mn = self.manifest
-    local cmd = {}
-
-    cmd[#cmd + 1] = mn.cc
-
-    assert(mn.cflags, "manifest missing 'cflags'")
-    build.cmd_append_arg(cmd, mn.cflags)
-
-    for _, v in ipairs(self.build_args) do
-        build.cmd_append_arg(cmd, v)
-    end
-
-    assert(#self.ins == 1, "compile expects exactly 1 input, got " .. #self.ins)
-    cmd[#cmd + 1] = "-c"
-    cmd[#cmd + 1] = self.ins[1]
-
-    cmd[#cmd + 1] = "-o"
-    cmd[#cmd + 1] = self.name
-
-    return cmd
-end
-
-function target:compile()
-    local cmd = self:compile_args()
-    build.ensure_parent_dir(self.name)
-    local cmd_str = table.concat(cmd, " ")
-    print("compile: " .. cmd_str)
+---@return boolean
+function Target:run()
+    impl.ensure_parent_dir(self.name)
+    local cmd_str = self.command(self.name, self.ins)
+    print(self.tag .. ": " .. cmd_str)
     local ok = os.execute(cmd_str)
     return ok ~= nil
 end
 
-function target:link_exe()
-    local mn = self.manifest
-    local cmd = {}
+-- ── MuhNinja ───────────────────────────────────────────────────────────────
 
-    cmd[#cmd + 1] = mn.cc
+---@class MuhNinja
+---@field manifest Manifest
+local MuhNinja = {}
+MuhNinja.__index = MuhNinja
 
-    for _, v in ipairs(self.build_args) do
-        build.cmd_append_arg(cmd, v)
-    end
-
-    for _, the_in in ipairs(self.ins) do
-        cmd[#cmd + 1] = the_in
-    end
-
-    cmd[#cmd + 1] = "-o"
-    cmd[#cmd + 1] = self.name
-
-    build.ensure_parent_dir(self.name)
-    local cmd_str = table.concat(cmd, " ")
-    print("link_exe: " .. cmd_str)
-    local ok = os.execute(cmd_str)
-    return ok ~= nil
-end
-
-function target:archive()
-    local mn = self.manifest
-    local ar = mn.ar or "ar"
-    local arflags = mn.arflags or "rcs"
-    local cmd = {}
-
-    cmd[#cmd + 1] = ar
-    cmd[#cmd + 1] = arflags
-    cmd[#cmd + 1] = self.name
-
-    for _, the_in in ipairs(self.ins) do
-        cmd[#cmd + 1] = the_in
-    end
-
-    build.ensure_parent_dir(self.name)
-    os.remove(self.name)
-    local cmd_str = table.concat(cmd, " ")
-    print("archive: " .. cmd_str)
-    local ok = os.execute(cmd_str)
-    return ok ~= nil
-end
-
-local muh_ninja = {}
-muh_ninja.__index = muh_ninja
-
-function muh_ninja.new(b)
-    local self = setmetatable({}, muh_ninja)
-    self.build = b
+---@param mn Manifest
+---@return MuhNinja
+function MuhNinja.new(mn)
+    local self = setmetatable({}, MuhNinja)
+    self.manifest = mn
     return self
 end
 
-function muh_ninja.already_built(target)
-    local out_attr = lfs.attributes(target.name)
+---@param tgt Target
+---@return boolean
+function MuhNinja.already_built(tgt)
+    local out_attr = lfs.attributes(tgt.name)
     if not out_attr then return false end
+
+    -- No inputs → existence-only check (cmake_lib sentinel, dir targets)
+    if #tgt.ins == 0 then return true end
+
     local out_mtime = out_attr.modification
 
-    for _, src in ipairs(target.ins) do
+    for _, src in ipairs(tgt.ins) do
         local in_attr = lfs.attributes(src)
         if not in_attr then return false end
         if in_attr.modification > out_mtime then return false end
     end
 
-    for _, dep in ipairs(target.deps) do
+    for _, dep in ipairs(tgt.deps) do
         local dep_attr = lfs.attributes(dep.name)
         if not dep_attr then return false end
         if dep_attr.modification > out_mtime then return false end
@@ -317,7 +266,9 @@ function muh_ninja.already_built(target)
     return true
 end
 
-function muh_ninja.topo_sort(root)
+---@param root Target
+---@return Target[]
+function MuhNinja.topo_sort(root)
     local order = {}
     local visited = {}
     local function visit(node)
@@ -332,71 +283,224 @@ function muh_ninja.topo_sort(root)
     return order
 end
 
-function muh_ninja.run(root)
-    local order = muh_ninja.topo_sort(root)
+---@param root Target
+---@return boolean
+function MuhNinja.run(root)
+    local order = MuhNinja.topo_sort(root)
     for i = 1, #order do
         local node = order[i]
-        if not muh_ninja.already_built(node) then
+        if not MuhNinja.already_built(node) then
             if not node:run() then return false end
         end
     end
     return true
 end
 
-function muh_ninja.clean(root)
-    local order = muh_ninja.topo_sort(root)
-    -- reverse topo: dependents before deps
+---@param root Target
+function MuhNinja.clean(root)
+    local order = MuhNinja.topo_sort(root)
     for i = #order, 1, -1 do
         local node = order[i]
-        if os.remove(node.name) then
-            print("rm: " .. node.name)
+        if node.clean_fn then
+            node.clean_fn(node.name)
+        else
+            if os.remove(node.name) then
+                print("rm: " .. node.name)
+            end
         end
     end
 end
 
-function muh_ninja:target_compile(path, name, build_args, deps)
-    return target.new("compile", {
-        name = name,
-        manifest = self.build.manifest,
-        build_args = build_args,
-        ins = { path },
+-- ── Target constructors ────────────────────────────────────────────────────
+
+---@param src string
+---@param out string
+---@param extra_args string[]
+---@param deps Target[]
+---@return Target
+function MuhNinja:target_compile(src, out, extra_args, deps)
+    local mn = self.manifest
+    return Target.new({
+        name = out,
+        ins = { src },
         deps = deps,
+        tag = "compile",
+        command = function(name, ins)
+            return mn.compile_cmd(name, ins[1], extra_args)
+        end,
     })
 end
 
-function muh_ninja:target_link(ins, name, build_args, deps)
-    return target.new("link_exe", {
-        name = name,
-        manifest = self.build.manifest,
-        build_args = build_args,
+---@param ins string[]
+---@param out string
+---@param extra_args string[]
+---@param deps Target[]
+---@return Target
+function MuhNinja:target_link(ins, out, extra_args, deps)
+    local mn = self.manifest
+    return Target.new({
+        name = out,
         ins = ins,
         deps = deps,
+        tag = "link_exe",
+        command = function(name, the_ins)
+            return mn.link_cmd(name, the_ins, extra_args)
+        end,
     })
 end
 
-function muh_ninja:target_archive(ins, name, deps)
-    return target.new("archive", {
-        name = name,
-        manifest = self.build.manifest,
-        build_args = {},
+---@param ins string[]
+---@param out string
+---@param deps Target[]
+---@return Target
+function MuhNinja:target_archive(ins, out, deps)
+    local mn = self.manifest
+    return Target.new({
+        name = out,
         ins = ins,
         deps = deps,
+        tag = "archive",
+        command = function(name, the_ins)
+            os.remove(name)
+            return mn.archive_cmd(name, the_ins)
+        end,
     })
 end
 
-local muh_cmake = {}
-muh_cmake.__index = muh_cmake
+-- ── CMake version policy ───────────────────────────────────────────────────
+-- Per-vendor cmake_minimum_version check.  Generic version helpers live in
+-- Infra (parse_version, compare_versions, get_cmake_version).
 
-function muh_cmake.new(b, ninja)
-    local self = setmetatable({}, muh_cmake)
-    self.build = b
+---@param vl VendorLibCmake
+local function check_cmake_version(vl)
+    if not vl.cmake_minimum_version then return end
+    local installed = Infra.get_cmake_version()
+    assert(installed,
+        "cmake not found. Vendor lib '" .. vl.name .. "' requires cmake >= " .. vl.cmake_minimum_version)
+    local inst_parts = Infra.parse_version(installed)
+    local req_parts = Infra.parse_version(vl.cmake_minimum_version)
+    assert(Infra.compare_versions(inst_parts, req_parts) >= 0,
+        "cmake version " .. installed .. " is too old for vendor lib '" .. vl.name
+        .. "'. Required >= " .. vl.cmake_minimum_version)
+end
+
+---@param vl VendorLibCmake
+---@return Target
+function MuhNinja:target_cmake_lib(vl)
+    local mn = self.manifest
+    local sentinel = path_join(PROJECT_PATH, vl.sentinel)
+    local out_dir = path_join(PROJECT_PATH, vl.out)
+    return Target.new({
+        name = sentinel,
+        ins = {},
+        deps = {},
+        tag = "cmake_lib",
+        command = function(_, _)
+            check_cmake_version(vl)
+            local src = path_join(PROJECT_PATH, vl.src)
+            impl.mkdir_p(out_dir)
+            return mn.cmake_lib_cmd(vl, src, out_dir)
+        end,
+        clean = function(_)
+            if impl.rmdir_rf(out_dir) then
+                print("rmdir: " .. out_dir)
+            end
+        end,
+    })
+end
+
+-- ── MuhCmake (project graph builder) ───────────────────────────────────────
+
+---@class NamedEntry
+---@field target Target
+---@field kind string
+---@field vendor_lib VendorLibCmake?
+
+---@class TargetsResult
+---@field named table<string, NamedEntry>
+---@field defaults {name: string, target: Target}[]
+---@field compile_targets Target[]
+---@field build_dir string
+
+---@class MuhCmake
+---@field manifest Manifest
+---@field ninja MuhNinja
+---@field packages table<string, {name: string, dir: string, srcs: string[], tests: string[]}>
+---@field cmds table<string, {name: string, dir: string, src: string}>
+local MuhCmake = {}
+MuhCmake.__index = MuhCmake
+
+---@param mn Manifest
+---@param ninja MuhNinja
+---@return MuhCmake
+function MuhCmake.new(mn, ninja)
+    local self = setmetatable({}, MuhCmake)
+    self.manifest = mn
     self.ninja = ninja
-    self.packages = {} -- { name = { dir=, srcs={}, tests={} } }
-    self.cmds = {}     -- { name = { dir=, src= } }
+    self.packages = {}
+    self.cmds = {}
     return self
 end
 
-function muh_cmake:discover_packages()
+---@param mn Manifest
+---@return string[] vendor_cflags
+---@return string[] vendor_static_libs
+---@return string[] link_flags
+function MuhCmake.resolve_vendor_flags(mn)
+    local vendor_cflags = {}
+    local vendor_static_libs = {}
+    local link_flags = {}
+    local seen_flags = {}
+    if mn.vendor_libs then
+        for _, vl in ipairs(mn.vendor_libs) do
+            if vl.include_dirs then
+                for _, d in ipairs(vl.include_dirs) do
+                    vendor_cflags[#vendor_cflags + 1] = "-I" .. path_join(PROJECT_PATH, d)
+                end
+            end
+            if vl.static_libs then
+                for _, lib in ipairs(vl.static_libs) do
+                    vendor_static_libs[#vendor_static_libs + 1] = path_join(PROJECT_PATH, lib)
+                end
+            end
+        end
+    end
+    if mn.system_libs then
+        for _, flag in ipairs(mn.system_libs) do
+            if not seen_flags[flag] then
+                seen_flags[flag] = true
+                link_flags[#link_flags + 1] = flag
+            end
+        end
+    end
+    return vendor_cflags, vendor_static_libs, link_flags
+end
+
+---@param mn Manifest
+---@return table<string, NamedEntry> vendor_named
+---@return Target[] cmake_targets
+function MuhCmake:resolve_vendor_targets(mn)
+    local vendor_named = {}
+    local cmake_targets = {}
+    if not mn.vendor_libs then return vendor_named, cmake_targets end
+    for _, vl in ipairs(mn.vendor_libs) do
+        if vl.kind == "cmake" then
+            local tname = "vendor:" .. vl.name
+            local tgt = self.ninja:target_cmake_lib(vl)
+            vendor_named[tname] = {
+                target = tgt,
+                kind = "vendor",
+                vendor_lib = vl,
+            }
+            cmake_targets[#cmake_targets + 1] = tgt
+        else
+            error("Not implemented " .. vl.kind)
+        end
+    end
+    return vendor_named, cmake_targets
+end
+
+function MuhCmake:discover_packages()
     local function is_c_file(filename)
         return filename:match("%.c$") ~= nil
     end
@@ -434,7 +538,7 @@ function muh_cmake:discover_packages()
     end
 end
 
-function muh_cmake:discover_cmds()
+function MuhCmake:discover_cmds()
     local cmd_dir = path_join(PROJECT_PATH, "cmd")
     for entry in lfs.dir(cmd_dir) do
         if entry == "." or entry == ".." then goto continue end
@@ -452,24 +556,53 @@ function muh_cmake:discover_cmds()
     end
 end
 
-function muh_cmake:generate()
+---@param obj_path string
+---@param obj_target Target
+---@param all_lib_targets Target[]
+---@param cmake_targets Target[]
+---@param vendor_static_libs string[]
+---@return string[] link_ins
+---@return Target[] link_deps
+local function assemble_link_deps(obj_path, obj_target, all_lib_targets, cmake_targets, vendor_static_libs)
+    local link_ins = { obj_path }
+    local link_deps = { obj_target }
+    for _, lib_t in ipairs(all_lib_targets) do
+        link_ins[#link_ins + 1] = lib_t.name
+        link_deps[#link_deps + 1] = lib_t
+    end
+    for _, cmake_t in ipairs(cmake_targets) do
+        link_deps[#link_deps + 1] = cmake_t
+    end
+    for _, vsl in ipairs(vendor_static_libs) do
+        link_ins[#link_ins + 1] = vsl
+    end
+    return link_ins, link_deps
+end
+
+---@return TargetsResult
+function MuhCmake:generate()
     self:discover_packages()
     self:discover_cmds()
 
-    local mn = self.build.manifest
-    local raw_build_dir = mn.build_dir or "build"
-    local build_dir
-    if build.is_absolute(raw_build_dir) then
-        build_dir = raw_build_dir
-    else
-        build_dir = path_join(PROJECT_PATH, raw_build_dir)
-    end
+    local mn = self.manifest
+    local build_dir = resolve_path(PROJECT_PATH, mn.build_dir or "build")
+
+    local vendor_cflags, vendor_static_libs, vendor_link_flags = MuhCmake.resolve_vendor_flags(mn)
+
     local common_cflags = { "-I" .. PROJECT_PATH }
+    for _, vf in ipairs(vendor_cflags) do
+        common_cflags[#common_cflags + 1] = vf
+    end
 
     local all_lib_targets = {}
     local named = {}
     local default_targets = {}
     local compile_targets = {}
+
+    local vendor_named, cmake_targets = self:resolve_vendor_targets(mn)
+    for k, v in pairs(vendor_named) do
+        named[k] = v
+    end
 
     local pkg_names = sorted_keys(self.packages)
 
@@ -503,15 +636,11 @@ function muh_cmake:generate()
         local main_t = self.ninja:target_compile(cmd_info.src, obj_path, common_cflags, {})
         compile_targets[#compile_targets + 1] = main_t
 
-        local link_ins = { obj_path }
-        local link_deps = { main_t }
-        for _, lib_t in ipairs(all_lib_targets) do
-            link_ins[#link_ins + 1] = lib_t.name
-            link_deps[#link_deps + 1] = lib_t
-        end
+        local link_ins, link_deps = assemble_link_deps(
+            obj_path, main_t, all_lib_targets, cmake_targets, vendor_static_libs)
 
         local exe_path = path_join(build_dir, "bin", name)
-        local exe_t = self.ninja:target_link(link_ins, exe_path, {}, link_deps)
+        local exe_t = self.ninja:target_link(link_ins, exe_path, vendor_link_flags, link_deps)
         local tname = "cmd:" .. name
         named[tname] = { target = exe_t, kind = "cmd" }
         default_targets[#default_targets + 1] = { name = tname, target = exe_t }
@@ -525,15 +654,11 @@ function muh_cmake:generate()
             local test_obj_t = self.ninja:target_compile(test_src, obj_path, common_cflags, {})
             compile_targets[#compile_targets + 1] = test_obj_t
 
-            local link_ins = { obj_path }
-            local link_deps = { test_obj_t }
-            for _, lib_t in ipairs(all_lib_targets) do
-                link_ins[#link_ins + 1] = lib_t.name
-                link_deps[#link_deps + 1] = lib_t
-            end
+            local link_ins, link_deps = assemble_link_deps(
+                obj_path, test_obj_t, all_lib_targets, cmake_targets, vendor_static_libs)
 
             local test_exe_path = path_join(build_dir, "bin", basename)
-            local test_t = self.ninja:target_link(link_ins, test_exe_path, {}, link_deps)
+            local test_t = self.ninja:target_link(link_ins, test_exe_path, vendor_link_flags, link_deps)
             local test_pkg = basename:match("^(.+)_test$") or basename
             local tname = "test:" .. test_pkg
             named[tname] = { target = test_t, kind = "test" }
@@ -549,13 +674,19 @@ function muh_cmake:generate()
     }
 end
 
-function muh_cmake.write_compile_commands(targets_result)
+---@param targets_result TargetsResult
+function MuhCmake.write_compile_commands(targets_result)
     local compile_targets = targets_result.compile_targets
     local build_dir = targets_result.build_dir
 
     local entries = {}
     for _, t in ipairs(compile_targets) do
-        local args = t:compile_args()
+        local cmd_str = t.command(t.name, t.ins) --[[@as string]]
+
+        local args = {}
+        for word in cmd_str:gmatch("%S+") do
+            args[#args + 1] = word
+        end
 
         local args_json = {}
         for _, a in ipairs(args) do
@@ -573,59 +704,97 @@ function muh_cmake.write_compile_commands(targets_result)
 
     local json = "[\n" .. table.concat(entries, ",\n") .. "\n]\n"
     local out_path = path_join(build_dir, "compile_commands.json")
-    build.mkdir_p(build_dir)
-    local f = io.open(out_path, "w")
-    assert(f, "Cannot open " .. out_path)
-    f:write(json)
-    f:close()
+    impl.mkdir_p(build_dir)
+    local fh = io.open(out_path, "w")
+    assert(fh, "Cannot open " .. out_path)
+    fh:write(json)
+    fh:close()
     print("wrote: " .. out_path)
 end
 
-local b = build.new()
+---@param defaults {name: string, target: Target}[]
+---@return boolean
+local function run_defaults(defaults)
+    for _, dt in ipairs(defaults) do
+        if not MuhNinja.run(dt.target) then
+            print("FAIL: " .. dt.target.name)
+            os.exit(1)
+        end
+    end
+    return true
+end
+
+--- Install built artifacts according to manifest install_rules.
+--- Builds all default targets first, then copies files.
+---@param targets TargetsResult
+---@param mn Manifest
+---@param prefix string?  Override install prefix (nil = use manifest default)
+function MuhCmake.install(targets, mn, prefix)
+    run_defaults(targets.defaults)
+
+    local rules = mn.install_rules
+    assert(rules and #rules > 0, "No install_rules defined in manifest")
+
+    -- Resolve install prefix: explicit > manifest install_prefix > build_dir/install
+    prefix = prefix
+        or mn.install_prefix
+        or (mn.build_dir or "build") .. "/install"
+    prefix = resolve_path(PROJECT_PATH, prefix)
+
+    for _, rule in ipairs(rules) do
+        local src_path = path_join(targets.build_dir, rule.src)
+        local dest_path = path_join(prefix, rule.dest)
+        local ok, err = impl.copy_file(src_path, dest_path)
+        if ok then
+            print("install: " .. src_path .. " -> " .. dest_path)
+        else
+            error("install failed: " .. (err or "unknown error"))
+        end
+    end
+end
+
+-- ── Main ───────────────────────────────────────────────────────────────────
+
+local b = Infra.new()
 b:parse_args()
 
-local ninja = muh_ninja.new(b)
-local cmake = muh_cmake.new(b, ninja)
+local ninja = MuhNinja.new(b.manifest)
+local cmake = MuhCmake.new(b.manifest, ninja)
 local targets = cmake:generate()
-muh_cmake.write_compile_commands(targets)
 
-if b.mode == "list" then
+if b.subcommand == "build" or b.subcommand == "compiledb" or b.subcommand == "install" then
+    MuhCmake.write_compile_commands(targets)
+end
+
+if b.subcommand == "list" then
     local names = sorted_keys(targets.named)
     for _, name in ipairs(names) do
         print(name)
     end
     os.exit(0)
-end
-
-if b.mode == "compiledb" then
+elseif b.subcommand == "compiledb" then
     os.exit(0)
-end
-
-if b.mode == "clean" then
+elseif b.subcommand == "clean" then
     if b.target then
         local entry = targets.named[b.target]
-        assert(entry, "Unknown target '" .. b.target .. "'. Use --list to see available targets.")
-        muh_ninja.clean(entry.target)
+        assert(entry, "Unknown target '" .. b.target .. "'. Use 'list' command to see available targets.")
+        MuhNinja.clean(entry.target)
     else
         for _, dt in ipairs(targets.defaults) do
-            muh_ninja.clean(dt.target)
+            MuhNinja.clean(dt.target)
         end
     end
     os.exit(0)
-end
-
-if b.target then
+elseif b.subcommand == "install" then
+    MuhCmake.install(targets, b.manifest, b.prefix)
+    os.exit(0)
+elseif b.target then
     local entry = targets.named[b.target]
-    assert(entry, "Unknown target '" .. b.target .. "'. Use --list to see available targets.")
-    if not muh_ninja.run(entry.target) then
+    assert(entry, "Unknown target '" .. b.target .. "'. Use 'list' command to see available targets.")
+    if not MuhNinja.run(entry.target) then
         print("FAIL: " .. entry.target.name)
         os.exit(1)
     end
 else
-    for _, dt in ipairs(targets.defaults) do
-        if not muh_ninja.run(dt.target) then
-            print("FAIL: " .. dt.target.name)
-            os.exit(1)
-        end
-    end
+    run_defaults(targets.defaults)
 end
