@@ -56,58 +56,14 @@ Infra.__index      = Infra
 Infra.path_join    = path_join
 Infra.PROJECT_PATH = PROJECT_PATH
 
-local SUBCOMMANDS = {
-    build = true, list = true, clean = true,
-    compiledb = true, install = true, help = true,
+local SUBCOMMANDS  = {
+    build = true,
+    list = true,
+    clean = true,
+    compiledb = true,
+    install = true,
+    help = true,
 }
-
-
---- Parse a dotted version string into a list of integers.
---- e.g. "3.16.2" → {3, 16, 2}
----@param s string
----@return integer[]
-function Infra.parse_version(s)
-    local parts = {}
-    for n in s:gmatch("(%d+)") do
-        parts[#parts + 1] = tonumber(n)
-    end
-    return parts
-end
-
---- Compare two parsed version tables (as returned by parse_version).
---- Returns -1 if a < b, 0 if equal, 1 if a > b.
----@param a integer[]
----@param b integer[]
----@return -1|0|1
-function Infra.compare_versions(a, b)
-    local len = math.max(#a, #b)
-    for i = 1, len do
-        local va = a[i] or 0
-        local vb = b[i] or 0
-        if va < vb then return -1 end
-        if va > vb then return 1 end
-    end
-    return 0
-end
-
---- Run `<tool> --version` and extract the first version-like string from
---- the first line of output.  Returns the version string or nil.
----@param tool_cmd string
----@return string?
-function Infra.get_tool_version(tool_cmd)
-    local h = io.popen(tool_cmd .. " --version 2>/dev/null")
-    if not h then return nil end
-    local line = h:read("*l")
-    h:close()
-    if not line then return nil end
-    return line:match("(%d+%.%d+[%.%d]*)")
-end
-
---- Convenience wrapper: get the installed cmake version string.
----@return string?
-function Infra.get_cmake_version()
-    return Infra.get_tool_version("cmake")
-end
 
 function Infra.print_usage()
     print([[
@@ -137,16 +93,16 @@ function Infra.new()
     return self
 end
 
----@param cur_arg integer
----@param flag string
----@return string value, integer next_arg
-local function consume_flag_value(cur_arg, flag)
-    cur_arg = cur_arg + 1
-    assert(cur_arg <= #arg, "Expected value for flag '" .. flag .. "'")
-    return arg[cur_arg], cur_arg + 1
-end
-
 function Infra:parse_args()
+    ---@param cur_arg integer
+    ---@param flag string
+    ---@return string value, integer next_arg
+    local function consume_flag_value(cur_arg, flag)
+        cur_arg = cur_arg + 1
+        assert(cur_arg <= #arg, "Expected value for flag '" .. flag .. "'")
+        return arg[cur_arg], cur_arg + 1
+    end
+
     local cur_arg = 1
 
     -- First positional argument is the subcommand (if it doesn't start with '-')
@@ -246,7 +202,7 @@ function MuhNinja.already_built(tgt)
     local out_attr = lfs.attributes(tgt.name)
     if not out_attr then return false end
 
-    -- No inputs → existence-only check (cmake_lib sentinel, dir targets)
+    -- No inputs → existence-only check
     if #tgt.ins == 0 then return true end
 
     local out_mtime = out_attr.modification
@@ -367,27 +323,65 @@ function MuhNinja:target_archive(ins, out, deps)
     })
 end
 
--- ── CMake version policy ───────────────────────────────────────────────────
--- Per-vendor cmake_minimum_version check.  Generic version helpers live in
--- Infra (parse_version, compare_versions, get_cmake_version).
-
----@param vl VendorLibCmake
-local function check_cmake_version(vl)
-    if not vl.cmake_minimum_version then return end
-    local installed = Infra.get_cmake_version()
-    assert(installed,
-        "cmake not found. Vendor lib '" .. vl.name .. "' requires cmake >= " .. vl.cmake_minimum_version)
-    local inst_parts = Infra.parse_version(installed)
-    local req_parts = Infra.parse_version(vl.cmake_minimum_version)
-    assert(Infra.compare_versions(inst_parts, req_parts) >= 0,
-        "cmake version " .. installed .. " is too old for vendor lib '" .. vl.name
-        .. "'. Required >= " .. vl.cmake_minimum_version)
-end
-
 ---@param vl VendorLibCmake
 ---@return Target
 function MuhNinja:target_cmake_lib(vl)
     local mn = self.manifest
+
+    ---@param s string
+    ---@return integer[]
+    local function parse_version(s)
+        local parts = {}
+        for n in s:gmatch("(%d+)") do
+            parts[#parts + 1] = tonumber(n)
+        end
+        return parts
+    end
+
+    ---@param a integer[]
+    ---@param b integer[]
+    ---@return -1|0|1
+    local function compare_versions(a, b)
+        local len = math.max(#a, #b)
+        for i = 1, len do
+            local va = a[i] or 0
+            local vb = b[i] or 0
+            if va < vb then return -1 end
+            if va > vb then return 1 end
+        end
+        return 0
+    end
+
+    ---@param tool_cmd string
+    ---@return string?
+    local function get_tool_version(tool_cmd)
+        local h = io.popen(tool_cmd .. " --version 2>/dev/null")
+        if not h then return nil end
+        local line = h:read("*l")
+        h:close()
+        if not line then return nil end
+        return line:match("(%d+%.%d+[%.%d]*)")
+    end
+
+    --- Convenience wrapper: get the installed cmake version string.
+    ---@return string?
+    local function get_cmake_version()
+        return get_tool_version("cmake")
+    end
+
+    ---@param vl2 VendorLibCmake
+    local function check_cmake_version(vl2)
+        if not vl2.cmake_minimum_version then return end
+        local installed = get_cmake_version()
+        assert(installed,
+            "cmake not found. Vendor lib '" .. vl2.name .. "' requires cmake >= " .. vl2.cmake_minimum_version)
+        local inst_parts = parse_version(installed)
+        local req_parts = parse_version(vl2.cmake_minimum_version)
+        assert(compare_versions(inst_parts, req_parts) >= 0,
+            "cmake version " .. installed .. " is too old for vendor lib '" .. vl2.name
+            .. "'. Required >= " .. vl2.cmake_minimum_version)
+    end
+
     local sentinel = path_join(PROJECT_PATH, vl.sentinel)
     local out_dir = path_join(PROJECT_PATH, vl.out)
     return Target.new({
@@ -481,8 +475,8 @@ end
 ---@return Target[] cmake_targets
 function MuhCmake:resolve_vendor_targets(mn)
     local vendor_named = {}
-    local cmake_targets = {}
-    if not mn.vendor_libs then return vendor_named, cmake_targets end
+    local vendor_targets = {}
+    if not mn.vendor_libs then return vendor_named, vendor_targets end
     for _, vl in ipairs(mn.vendor_libs) do
         if vl.kind == "cmake" then
             local tname = "vendor:" .. vl.name
@@ -492,12 +486,12 @@ function MuhCmake:resolve_vendor_targets(mn)
                 kind = "vendor",
                 vendor_lib = vl,
             }
-            cmake_targets[#cmake_targets + 1] = tgt
+            vendor_targets[#vendor_targets + 1] = tgt
         else
             error("Not implemented " .. vl.kind)
         end
     end
-    return vendor_named, cmake_targets
+    return vendor_named, vendor_targets
 end
 
 function MuhCmake:discover_packages()
@@ -599,7 +593,7 @@ function MuhCmake:generate()
     local default_targets = {}
     local compile_targets = {}
 
-    local vendor_named, cmake_targets = self:resolve_vendor_targets(mn)
+    local vendor_named, vendor_targets = self:resolve_vendor_targets(mn)
     for k, v in pairs(vendor_named) do
         named[k] = v
     end
@@ -637,7 +631,7 @@ function MuhCmake:generate()
         compile_targets[#compile_targets + 1] = main_t
 
         local link_ins, link_deps = assemble_link_deps(
-            obj_path, main_t, all_lib_targets, cmake_targets, vendor_static_libs)
+            obj_path, main_t, all_lib_targets, vendor_targets, vendor_static_libs)
 
         local exe_path = path_join(build_dir, "bin", name)
         local exe_t = self.ninja:target_link(link_ins, exe_path, vendor_link_flags, link_deps)
@@ -655,7 +649,7 @@ function MuhCmake:generate()
             compile_targets[#compile_targets + 1] = test_obj_t
 
             local link_ins, link_deps = assemble_link_deps(
-                obj_path, test_obj_t, all_lib_targets, cmake_targets, vendor_static_libs)
+                obj_path, test_obj_t, all_lib_targets, vendor_targets, vendor_static_libs)
 
             local test_exe_path = path_join(build_dir, "bin", basename)
             local test_t = self.ninja:target_link(link_ins, test_exe_path, vendor_link_flags, link_deps)
