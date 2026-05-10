@@ -15,15 +15,13 @@ local lfs          = impl.lfs
 local json_escape  = impl.json_escape
 local resolve_path = impl.resolve_path
 
----@class VendorLibCmake
----@field kind "cmake"
+---@class VendorLib
 ---@field name string
 ---@field version string
----@field cmake_minimum_version string
 ---@field src string
 ---@field out string
----@field cmake_args string[]
----@field cmake_build_target string?
+---@field build_cmd fun(src: string, out_dir: string, args: any[]): string
+---@field clean_cmd (fun(src: string): string)?
 ---@field sentinel string
 ---@field include_dirs string[]
 ---@field static_libs string[]
@@ -41,8 +39,9 @@ local resolve_path = impl.resolve_path
 ---@field compile_cmd fun(out: string, src: string, extra_args: string[]): string
 ---@field link_cmd fun(out: string, ins: string[], extra_args: string[]): string
 ---@field archive_cmd fun(out: string, ins: string[]): string
----@field cmake_lib_cmd fun(vl: VendorLibCmake, src: string, out_dir: string): string
----@field vendor_libs VendorLibCmake[]?
+---@field preconfigure fun(infra: Infra)
+---@field postconfigure fun(infra: Infra)
+---@field vendor_libs VendorLib[]?
 
 ---@alias Subcommand "build"|"list"|"clean"|"compiledb"|"install"|"help"
 
@@ -147,6 +146,41 @@ function Infra:parse_args()
     if self.prefix and self.subcommand ~= "install" then
         self.manifest.build_dir = self.prefix
     end
+end
+
+---@param s string
+---@return integer[]
+function Infra.parse_version(s)
+    local parts = {}
+    for n in s:gmatch("(%d+)") do
+        parts[#parts + 1] = tonumber(n)
+    end
+    return parts
+end
+
+---@param a integer[]
+---@param b integer[]
+---@return -1|0|1
+function Infra.compare_versions(a, b)
+    local len = math.max(#a, #b)
+    for i = 1, len do
+        local va = a[i] or 0
+        local vb = b[i] or 0
+        if va < vb then return -1 end
+        if va > vb then return 1 end
+    end
+    return 0
+end
+
+---@param tool_cmd string
+---@return string?
+function Infra.get_tool_version(tool_cmd)
+    local h = io.popen(tool_cmd .. " --version 2>/dev/null")
+    if not h then return nil end
+    local line = h:read("*l")
+    h:close()
+    if not line then return nil end
+    return line:match("(%d+%.%d+[%.%d]*)")
 end
 
 -- ── Target ─────────────────────────────────────────────────────────────────
@@ -323,79 +357,28 @@ function MuhNinja:target_archive(ins, out, deps)
     })
 end
 
----@param vl VendorLibCmake
+---@param vl VendorLib
 ---@return Target
-function MuhNinja:target_cmake_lib(vl)
-    local mn = self.manifest
-
-    ---@param s string
-    ---@return integer[]
-    local function parse_version(s)
-        local parts = {}
-        for n in s:gmatch("(%d+)") do
-            parts[#parts + 1] = tonumber(n)
-        end
-        return parts
-    end
-
-    ---@param a integer[]
-    ---@param b integer[]
-    ---@return -1|0|1
-    local function compare_versions(a, b)
-        local len = math.max(#a, #b)
-        for i = 1, len do
-            local va = a[i] or 0
-            local vb = b[i] or 0
-            if va < vb then return -1 end
-            if va > vb then return 1 end
-        end
-        return 0
-    end
-
-    ---@param tool_cmd string
-    ---@return string?
-    local function get_tool_version(tool_cmd)
-        local h = io.popen(tool_cmd .. " --version 2>/dev/null")
-        if not h then return nil end
-        local line = h:read("*l")
-        h:close()
-        if not line then return nil end
-        return line:match("(%d+%.%d+[%.%d]*)")
-    end
-
-    --- Convenience wrapper: get the installed cmake version string.
-    ---@return string?
-    local function get_cmake_version()
-        return get_tool_version("cmake")
-    end
-
-    ---@param vl2 VendorLibCmake
-    local function check_cmake_version(vl2)
-        if not vl2.cmake_minimum_version then return end
-        local installed = get_cmake_version()
-        assert(installed,
-            "cmake not found. Vendor lib '" .. vl2.name .. "' requires cmake >= " .. vl2.cmake_minimum_version)
-        local inst_parts = parse_version(installed)
-        local req_parts = parse_version(vl2.cmake_minimum_version)
-        assert(compare_versions(inst_parts, req_parts) >= 0,
-            "cmake version " .. installed .. " is too old for vendor lib '" .. vl2.name
-            .. "'. Required >= " .. vl2.cmake_minimum_version)
-    end
-
+function MuhNinja:target_vendor_lib(vl)
     local sentinel = path_join(PROJECT_PATH, vl.sentinel)
     local out_dir = path_join(PROJECT_PATH, vl.out)
     return Target.new({
         name = sentinel,
         ins = {},
         deps = {},
-        tag = "cmake_lib",
+        tag = "vendor_lib",
         command = function(_, _)
-            check_cmake_version(vl)
             local src = path_join(PROJECT_PATH, vl.src)
             impl.mkdir_p(out_dir)
-            return mn.cmake_lib_cmd(vl, src, out_dir)
+            return vl.build_cmd(src, out_dir, {})
         end,
         clean = function(_)
+            if vl.clean_cmd then
+                local src = path_join(PROJECT_PATH, vl.src)
+                local cmd_str = vl.clean_cmd(src)
+                print("vendor_clean: " .. cmd_str)
+                os.execute(cmd_str)
+            end
             if impl.rmdir_rf(out_dir) then
                 print("rmdir: " .. out_dir)
             end
@@ -408,7 +391,7 @@ end
 ---@class NamedEntry
 ---@field target Target
 ---@field kind string
----@field vendor_lib VendorLibCmake?
+---@field vendor_lib VendorLib?
 
 ---@class TargetsResult
 ---@field named table<string, NamedEntry>
@@ -472,24 +455,21 @@ end
 
 ---@param mn Manifest
 ---@return table<string, NamedEntry> vendor_named
----@return Target[] cmake_targets
+---@return Target[] vendor_targets
 function MuhCmake:resolve_vendor_targets(mn)
     local vendor_named = {}
     local vendor_targets = {}
     if not mn.vendor_libs then return vendor_named, vendor_targets end
     for _, vl in ipairs(mn.vendor_libs) do
-        if vl.kind == "cmake" then
-            local tname = "vendor:" .. vl.name
-            local tgt = self.ninja:target_cmake_lib(vl)
-            vendor_named[tname] = {
-                target = tgt,
-                kind = "vendor",
-                vendor_lib = vl,
-            }
-            vendor_targets[#vendor_targets + 1] = tgt
-        else
-            error("Not implemented " .. vl.kind)
-        end
+        assert(vl.build_cmd, "Vendor lib '" .. vl.name .. "' missing 'build_cmd' function")
+        local tname = "vendor:" .. vl.name
+        local tgt = self.ninja:target_vendor_lib(vl)
+        vendor_named[tname] = {
+            target = tgt,
+            kind = "vendor",
+            vendor_lib = vl,
+        }
+        vendor_targets[#vendor_targets + 1] = tgt
     end
     return vendor_named, vendor_targets
 end
@@ -553,19 +533,19 @@ end
 ---@param obj_path string
 ---@param obj_target Target
 ---@param all_lib_targets Target[]
----@param cmake_targets Target[]
+---@param vendor_targets Target[]
 ---@param vendor_static_libs string[]
 ---@return string[] link_ins
 ---@return Target[] link_deps
-local function assemble_link_deps(obj_path, obj_target, all_lib_targets, cmake_targets, vendor_static_libs)
+local function assemble_link_deps(obj_path, obj_target, all_lib_targets, vendor_targets, vendor_static_libs)
     local link_ins = { obj_path }
     local link_deps = { obj_target }
     for _, lib_t in ipairs(all_lib_targets) do
         link_ins[#link_ins + 1] = lib_t.name
         link_deps[#link_deps + 1] = lib_t
     end
-    for _, cmake_t in ipairs(cmake_targets) do
-        link_deps[#link_deps + 1] = cmake_t
+    for _, vt in ipairs(vendor_targets) do
+        link_deps[#link_deps + 1] = vt
     end
     for _, vsl in ipairs(vendor_static_libs) do
         link_ins[#link_ins + 1] = vsl
@@ -752,9 +732,13 @@ end
 local b = Infra.new()
 b:parse_args()
 
+b.manifest.preconfigure(b)
+
 local ninja = MuhNinja.new(b.manifest)
 local cmake = MuhCmake.new(b.manifest, ninja)
 local targets = cmake:generate()
+
+b.manifest.postconfigure(b)
 
 if b.subcommand == "build" or b.subcommand == "compiledb" or b.subcommand == "install" then
     MuhCmake.write_compile_commands(targets)

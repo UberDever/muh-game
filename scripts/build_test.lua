@@ -18,9 +18,19 @@ local path_join    = impl.path_join
 local lfs          = impl.lfs
 local PROJECT_DIR  = impl.PROJECT_PATH
 local BUILD_DIR    = path_join(PROJECT_DIR, "build")
-local LUA_BIN      = path_join(PROJECT_DIR, "vendor", "lua-5.5.0", "lua")
+local LUA_SRC_BIN  = path_join(PROJECT_DIR, "vendor", "lua-5.5.0", "lua")
 local BUILD_SCRIPT = path_join(PROJECT_DIR, "scripts", "build.lua")
 local MANIFEST     = path_join(PROJECT_DIR, "scripts", "manifest.debug.linux.lua")
+
+-- Copy lua binary to OS temp dir so tests survive vendor:lua clean
+local TMPDIR       = os.getenv("TMPDIR") or os.getenv("TEMP") or "/tmp"
+local LUA_BIN      = path_join(TMPDIR, "muh_game_test_lua")
+do
+    local ok, err = impl.copy_file(LUA_SRC_BIN, LUA_BIN)
+    assert(ok, "Cannot copy lua binary to temp: " .. (err or "unknown"))
+    -- Make executable (Unix)
+    if impl.IS_UNIX then os.execute("chmod +x " .. LUA_BIN) end
+end
 
 -- ── Test framework ─────────────────────────────────────────────────────────
 
@@ -529,6 +539,21 @@ do
 
     -- Cleanup
     impl.rmdir_rf(install_dir)
+end
+
+-- ── Restore repo state ─────────────────────────────────────────────────────
+-- Invariant: tests leave the repo unchanged.
+
+print("\n=== Restoring repo state ===")
+do
+    -- Rebuild vendor lua to restore source-dir binary
+    local lua_src = path_join(PROJECT_DIR, "vendor", "lua-5.5.0")
+    os.execute("make -B -C " .. lua_src .. " all > /dev/null 2>&1")
+    -- Clean build directory
+    impl.rmdir_rf(BUILD_DIR)
+    -- Remove temp lua binary
+    os.remove(LUA_BIN)
+    print("  repo state restored")
 end
 
 -- ── Results ────────────────────────────────────────────────────────────────
